@@ -8,9 +8,27 @@ New
 
 Improvements
 
+* Trust anchor certificates are now selected as described in
+  [draft-ietf-sidrops-rpki-ta-tiebreaker]: A retrieved certificate only
+  replaces the stored certificate if it was issued later or, if both were
+  issued at the same time, if it doesn’t expire later. This means that a
+  certificate re-issued with nothing but a later expiry time is not used
+  until the stored certificate has expired or was removed. The stored
+  certificate is now used whenever none of the URIs of the TAL provides a
+  valid certificate.
+* The trust anchor certificate is now stored once per TAL key under
+  `stored/ta/key` in the repository directory and is written atomically.
+  Certificates stored by earlier versions are picked up and moved over.
+
 Bug fixes
 
+* A failure to read or write a stored trust anchor certificate now fails
+  the validation run. Previously, it only ended the validation thread and
+  the run carried on without the trust anchor.
+
 Other changes
+
+[draft-ietf-sidrops-rpki-ta-tiebreaker]: https://datatracker.ietf.org/doc/draft-ietf-sidrops-rpki-ta-tiebreaker/
 
 
 ## 0.16.1 ‘You Cry, You Learn’

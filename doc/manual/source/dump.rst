@@ -29,15 +29,19 @@ store
     additional directory :file:`rsync` that contains files collected via rsync.
 
 ta
-    This directory contains the trust anchor certificates. Files are stored
-    in a directory structure two levels deep. The first level is the schema
-    portion of the certificate’s URI, i.e., ``https`` or ``rsync``, and the
-    second level is the authority portion of the URI, e.g., ``tal.apnic.net``.
-    Within this second level, the certificate is stored in a file that has
-    the hexadecimal encoding of the SHA-256 hash of the certificate’s URI
-    as the file name with the extension ``.cer`` appended.
+    This directory contains the trust anchor certificates. There is one
+    certificate for each trust anchor key. It is stored in the directory
+    :file:`key` in a file that has the hexadecimal encoding of the
+    certificate’s subject key identifier as the file name with the
+    extension ``.cer`` appended.
+
+    Certificates stored by earlier versions of Routinator are kept in the
+    directories :file:`https` and :file:`rsync` until they are removed
+    after the next successful validation run.
 
 .. versionadded:: 0.9.0
 .. versionchanged:: 0.11.1
    Stored trust anchor certificates are dumped into the ``ta`` directory.
+.. versionchanged:: 0.16.2
+   Trust anchor certificates are stored by key rather than by URI.
 

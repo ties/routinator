@@ -54,11 +54,17 @@
 //! URI of the manifest with the `rsync` scheme used as the first component
 //! instead. (There is no good reason for that, it just happened.)
 //!
-//! Trust anchor certficates are stored under `ta` using a three level
-//! directory structure derived from the URI the certificate is retrieved
-//! from. The first level is the scheme, `https` or `rsync`, the second
-//! level is the authority (i.e., hostname), and the third is the SHA-256
-//! hash of the full URI with an extension of `.cer` added.
+//! Trust anchor certficates are stored under `ta/key`. There is one file
+//! for each trust anchor key. It contains the most preferred valid
+//! certificate seen for that key. The file is named after the hex encoded
+//! key identifier of the key with an extension of `.cer` added.
+//!
+//! Earlier versions stored trust anchor certificates in a three level
+//! directory structure derived from the URI the certificate was retrieved
+//! from: `ta`, followed by the scheme, `https` or `rsync`, then the
+//! authority (i.e., hostname), and finally the SHA-256 hash of the full URI
+//! with an extension of `.cer` added. These files are still read but are
+//! removed during cleanup.
 //!
 //! Finally, the `tmp` directory is used to build the publication point files
 //! in so they can be constructed without yet knowing whether the update is
@@ -73,7 +79,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use log::error;
 use rpki::uri;
-use rpki::crypto::DigestAlgorithm;
+use rpki::crypto::{DigestAlgorithm, KeyIdentifier};
 use rpki::repository::cert::{Cert, ResourceCert};
 use rpki::repository::manifest::{ManifestContent, ManifestHash};
 use rpki::repository::tal::TalUri;
@@ -88,6 +94,7 @@ use crate::utils::fatal;
 use crate::utils::binio::{Compose, Parse, ParseError};
 use crate::utils::dump::DumpRegistry;
 use crate::utils::json::JsonBuilder;
+use crate::utils::str::append_hex;
 use crate::utils::uri::UriExt;
 
 
@@ -119,10 +126,16 @@ impl Store {
     /// The name of the status file.
     const STATUS_NAME: &'static str = "status.bin";
 
-    /// The dirctory for TA certificates retrieved via rsync.
+    /// The directory for everything related to TA certificates.
+    const TA_BASE: &'static str = "ta";
+
+    /// The directory for the TA certificates.
+    const KEY_TA_PATH: &'static str = "ta/key";
+
+    /// The legacy dirctory for TA certificates retrieved via rsync.
     const RSYNC_TA_PATH: &'static str = "ta/rsync";
 
-    /// The dirctory for TA certificates retrieved via HTTPS.
+    /// The legacy dirctory for TA certificates retrieved via HTTPS.
     const HTTPS_TA_PATH: &'static str = "ta/https";
 
     /// The directory for the RRDP repositories.
@@ -204,8 +217,16 @@ impl Store {
         self.path.join(Self::STATUS_NAME)
     }
 
-    /// Returns the path to use for the trust anchor at the given URI.
-    fn ta_path(&self, uri: &TalUri) -> PathBuf {
+    /// Returns the path to use for the trust anchor with the given key.
+    fn ta_path(&self, key: KeyIdentifier) -> PathBuf {
+        let mut name = String::new();
+        append_hex(key.as_slice(), &mut name);
+        name.push_str(".cer");
+        self.path.join(Self::KEY_TA_PATH).join(name)
+    }
+
+    /// Returns the path earlier versions used for the trust anchor at a URI.
+    fn legacy_ta_path(&self, uri: &TalUri) -> PathBuf {
         match *uri {
             TalUri::Rsync(ref uri) => {
                 self.path.join(
@@ -257,8 +278,7 @@ impl Store {
     /// Dumps the content of the store to `dir`.
     pub fn dump(&self, dir: &Path) -> Result<(), Failed> {
         // TA certificates.
-        self.dump_subdir(Self::RSYNC_TA_PATH, dir)?;
-        self.dump_subdir(Self::HTTPS_TA_PATH, dir)?;
+        self.dump_subdir(Self::TA_BASE, dir)?;
 
         // Dump store content.
         let dir = dir.join("store");
@@ -488,22 +508,58 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Loads a stored trust anchor certificate.
-    pub fn load_ta(&self, uri: &TalUri) -> Result<Option<Bytes>, Failed> {
-        fatal::read_existing_file(&self.store.ta_path(uri)).map(|maybe| {
+    /// Loads the stored trust anchor certificate for the given key.
+    pub fn load_ta(
+        &self, key: KeyIdentifier
+    ) -> Result<Option<Bytes>, Failed> {
+        fatal::read_existing_file(&self.store.ta_path(key)).map(|maybe| {
             maybe.map(Into::into)
         })
     }
 
-    /// Updates or inserts a stored trust anchor certificate.
+    /// Loads a trust anchor certificate stored by an earlier version.
+    ///
+    /// Earlier versions stored trust anchor certificates by the URI they
+    /// were retrieved from.
+    pub fn load_legacy_ta(
+        &self, uri: &TalUri
+    ) -> Result<Option<Bytes>, Failed> {
+        fatal::read_existing_file(
+            &self.store.legacy_ta_path(uri)
+        ).map(|maybe| {
+            maybe.map(Into::into)
+        })
+    }
+
+    /// Updates or inserts the stored trust anchor certificate for a key.
+    ///
+    /// The file is left alone if it already has the given content.
+    /// Otherwise it is replaced atomically.
     pub fn update_ta(
-        &self, uri: &TalUri, content: &[u8]
+        &self, key: KeyIdentifier, content: &[u8]
     ) -> Result<(), Failed> {
-        let path = self.store.ta_path(uri);
-        if let Some(dir) = path.parent() {
-            fatal::create_dir_all(dir)?;
+        let path = self.store.ta_path(key);
+        if fatal::read_existing_file(&path)?.as_deref() == Some(content) {
+            return Ok(())
         }
-        fatal::write_file(&path, content)
+        fatal::create_parent_all(&path)?;
+        let mut tmp_file = self.store.tmp_file()?;
+        if let Err(err) = tmp_file.write_all(content) {
+            error!(
+                "Fatal: failed to write to file {}: {}",
+                tmp_file.path().display(), err
+            );
+            return Err(Failed)
+        }
+        if let Err(err) = tmp_file.persist(&path) {
+            error!(
+                "Failed to persist temporary file {} to {}: {}",
+                err.file.path().display(), path.display(),
+                err.error,
+            );
+            return Err(Failed)
+        }
+        Ok(())
     }
 
     /// Accesses the repository for the provided RPKI CA.
@@ -586,9 +642,18 @@ impl Run<'_> {
     /// Cleans up the trust anchors.
     ///
     /// Deletes all files that either don’t successfully parse as certificates
-    /// or that are expired certificates.
+    /// or that are expired certificates. Also deletes everything outside of
+    /// the directory for the certificates stored by key, i.e., whatever
+    /// earlier versions have left behind. These certificates have been
+    /// considered when the run selected its trust anchor certificates, so
+    /// they aren’t needed any more.
     fn cleanup_ta(&self) -> Result<(), Failed> {
-        Self::cleanup_dir_tree(&self.store.path.join("ta"), |path| {
+        let base = self.store.path.join(Store::TA_BASE);
+        let key_path = self.store.path.join(Store::KEY_TA_PATH);
+        Self::cleanup_dir_tree(&base, |path| {
+            if !path.starts_with(&key_path) {
+                return Ok(false)
+            }
             let content = fatal::read_file(path)?;
             if let Ok(cert) = Cert::decode(Bytes::from(content)) {
                 if cert.validity().not_after() > Time::now() {
@@ -1614,6 +1679,43 @@ mod test {
         assert_eq!(point.next().unwrap().unwrap(), objects[0]);
         assert_eq!(point.next().unwrap().unwrap(), objects[1]);
         assert!(point.next().is_none());
+    }
+
+    #[test]
+    fn update_ta_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store { path: dir.path().into() };
+        let run = store.start();
+        let key = KeyIdentifier::from_str(
+            "0123456789ABCDEF0123456789ABCDEF01234567"
+        ).unwrap();
+        let path = dir.path().join(
+            "ta/key/0123456789abcdef0123456789abcdef01234567.cer"
+        );
+        let tmp = dir.path().join("tmp");
+
+        assert_eq!(run.load_ta(key).unwrap(), None);
+
+        run.update_ta(key, b"foo").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"foo");
+        assert_eq!(
+            run.load_ta(key).unwrap(), Some(Bytes::from_static(b"foo"))
+        );
+
+        // Updating with the same content doesn’t write anything.
+        fs::remove_dir(&tmp).unwrap();
+        run.update_ta(key, b"foo").unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"foo");
+
+        // Updating with new content replaces the file and doesn’t leave
+        // the temporary file behind.
+        run.update_ta(key, b"bar").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"bar");
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(), 1
+        );
     }
 }
 

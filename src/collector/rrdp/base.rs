@@ -424,6 +424,7 @@ impl<'a> Run<'a> {
             warn!(
                 "Could not read trust anchor certificate: {err}."
             );
+            return None
         }
 
         Some(Bytes::from(bytes))

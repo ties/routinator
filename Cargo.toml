@@ -49,6 +49,9 @@ uuid            = "1.1"
 nix             = { version = "0.31.3", features = ["fs", "mman", "net", "process", "socket", "user"] }
 syslog          = "7"
 
+[dev-dependencies]
+rpki            = { version = "0.20.1", features = [ "softkeys" ] }
+
 [features]
 default = [ "socks", "ui"]
 arbitrary = [ "dep:arbitrary", "chrono/arbitrary", "rpki/arbitrary" ]

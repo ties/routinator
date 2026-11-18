@@ -39,7 +39,7 @@ use rpki::repository::error::{InspectionError, ValidationError};
 use rpki::repository::manifest::{Manifest, ManifestContent, ManifestHash};
 use rpki::repository::roa::{Roa, RouteOriginAttestation};
 use rpki::repository::sigobj::SignedObject;
-use rpki::repository::tal::{Tal, TalInfo, TalUri};
+use rpki::repository::tal::{Tal, TalUri};
 use rpki::repository::x509::{Time, Validity};
 use rpki::uri;
 use crate::{collector, store, tals};
@@ -387,6 +387,13 @@ pub struct Run<'a, P> {
     /// Was a fatal error encountered during the run?
     is_fatal: AtomicBool,
 
+    /// A lock for selecting and storing trust anchor certificates.
+    ///
+    /// The stored trust anchor certificate is read, compared and updated
+    /// under this lock so that two TALs with the same key can’t race for
+    /// it.
+    ta_lock: Mutex<()>,
+
     /// The metrics collected during the run.
     metrics: Metrics,
 }
@@ -404,6 +411,7 @@ impl<'a, P> Run<'a, P> {
             validation, collector, store, processor, initial,
             had_err: AtomicBool::new(false),
             is_fatal: AtomicBool::new(false),
+            ta_lock: Mutex::new(()),
             metrics: Default::default()
         }
     }
@@ -515,96 +523,65 @@ impl<P: ProcessRun> Run<'_, P> {
         tasks: &SegQueue<Task<P::PubPoint>>,
         metrics: &mut RunMetrics,
     ) -> Result<(), Failed> {
-        for uri in task.tal.uris() {
-            let (cert, store_ta_cert) = match self.load_ta(uri, task.tal.info())? {
-                (Some(cert), store) => (cert, store),
-                _ => continue,
-            };
-            if cert.subject_public_key_info() != task.tal.key_info() {
-                warn!(
-                    "Trust anchor {uri}: key doesn’t match TAL."
+        // All candidate certificates are checked against the same time.
+        let now = Time::now();
+        let fetched = self.fetch_ta(task.tal, now);
+
+        // If this fails, the store is broken. We need to fail the whole run
+        // and not just end this thread.
+        let selected = self.select_ta(
+            task.tal, fetched, now
+        ).inspect_err(|_| {
+            self.run_failed(RunFailed::fatal());
+        })?;
+
+        let selected = selected.and_then(|(cert, uri)| {
+            CaCert::root(
+                cert, uri.clone(), task.index
+            ).ok().map(|cert| (cert, uri))
+        });
+        let Some((cert, uri)) = selected else {
+            if self.initial {
+                info!(
+                    "Initial quick validation failed: \
+                     no trust anchor for TAL {}.",
+                    task.tal.info().name()
                 );
-                continue;
+                self.run_failed(RunFailed::retry());
+                return Err(Failed)
             }
-            let cert = match cert.validate_ta(
-                task.tal.info().clone(), self.validation.strict
-            ) {
-                Ok(cert) => CaCert::root(cert, uri.clone(), task.index),
-                Err(err) => {
-                    warn!("Trust anchor {uri}: {err}.");
-                    continue;
-                }
-            };
-            let cert = match cert {
-                Ok(cert) => cert,
-                Err(_) => continue,
-            };
-
-            if store_ta_cert {
-                self.store.update_ta(uri, &cert.cert().to_captured())?;
+            else {
+                warn!(
+                    "No valid trust anchor for TAL {}",
+                    task.tal.info().name()
+                );
+                return Ok(())
             }
+        };
 
-            debug!("Found valid trust anchor {uri}. Processing.");
+        debug!("Found valid trust anchor {uri}. Processing.");
 
-            match self.processor.process_ta(
-                task.tal, uri, &cert, cert.tal
-            )? {
-                Some(processor) => {
-                    return self.process_ca_task(
-                        CaTask {
-                            cert, processor,
-                            repository_index: None,
-                            defer: false,
-                        },
-                        tasks, metrics,
-                    )
-                }
-                None => {
-                    debug!("Skipping trust anchor {uri}.");
-                    return Ok(())
-                }
+        let processor = self.processor.process_ta(
+            task.tal, uri, &cert, cert.tal
+        ).inspect_err(|_| {
+            self.run_failed(RunFailed::fatal());
+        })?;
+        match processor {
+            Some(processor) => {
+                self.process_ca_task(
+                    CaTask {
+                        cert, processor,
+                        repository_index: None,
+                        defer: false,
+                    },
+                    tasks, metrics,
+                )
+            }
+            None => {
+                debug!("Skipping trust anchor {uri}.");
+                Ok(())
             }
         }
-        if self.initial {
-            info!(
-                "Initial quick validation failed: \
-                 no trust anchor for TAL {}.",
-                task.tal.info().name()
-            );
-            self.run_failed(RunFailed::retry());
-            Err(Failed)
-        }
-        else {
-            warn!("No valid trust anchor for TAL {}", task.tal.info().name());
-            Ok(())
-        }
-    }
-
-    /// Loads a trust anchor certificate with the given URI.
-    ///
-    /// Attempts to download the certificate from upstream but falls back to
-    /// the version in the store if available.
-    /// 
-    /// Returns a tuple of the cert (if it exists) and whether it was newly
-    /// retrieved from the HTTPS endpoint (rather than loaded from disk).
-    fn load_ta(
-        &self,
-        uri: &TalUri,
-        _info: &TalInfo,
-    ) -> Result<(Option<Cert>, bool), Failed> {
-        // Get the new version, store and return it if it decodes.
-        if let Some(collector) = self.collector.as_ref() {
-            if let Some(bytes) = collector.load_ta(uri) {
-                if let Ok(cert) = Cert::decode(bytes.clone()) {
-                    return Ok((Some(cert), true))
-                }
-            }
-        }
-
-        // Get what we have in store.
-        self.store.load_ta(uri).map(|bytes| {
-            (bytes.and_then(|bytes| Cert::decode(bytes).ok()), false)
-        })
     }
 
     /// Processes a CA.
@@ -641,6 +618,247 @@ impl<P: ProcessRun> Run<'_, P> {
         self.had_err.store(true, Ordering::Relaxed);
         if err.is_fatal() {
             self.is_fatal.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// # Trust anchor certificate selection
+///
+/// The trust anchor certificate for a TAL is selected as described in
+/// [draft-ietf-sidrops-rpki-ta-tiebreaker]: The certificate retrieved
+/// during the run competes with the certificate kept in the store from
+/// earlier runs. The one issued later wins. If both were issued at the
+/// same time, the one that expires earlier wins. This way, an old
+/// certificate cannot replace a newer one that has been seen already.
+///
+/// [draft-ietf-sidrops-rpki-ta-tiebreaker]:
+///     https://datatracker.ietf.org/doc/draft-ietf-sidrops-rpki-ta-tiebreaker/
+impl<P> Run<'_, P> {
+    /// Retrieves the trust anchor certificate for a TAL.
+    ///
+    /// Tries the URIs of the TAL in turn. Returns the first certificate that
+    /// is a valid trust anchor certificate for the TAL at `now` together
+    /// with the URI it was retrieved from. Returns `None` if there isn’t one
+    /// or if the run doesn’t have a collector.
+    //
+    //  Note that the rsync collector returns whatever is in its working copy
+    //  even if updating the module has failed. This is fine since such a
+    //  certificate still has to hold up against the stored certificate.
+    fn fetch_ta<'t>(
+        &self, tal: &'t Tal, now: Time,
+    ) -> Option<(ResourceCert, &'t TalUri)> {
+        let collector = self.collector.as_ref()?;
+        for uri in tal.uris() {
+            let Some(bytes) = collector.load_ta(uri) else {
+                debug!("Trust anchor {uri}: no certificate retrieved.");
+                continue
+            };
+            match check_ta_cert(bytes, tal, self.validation.strict, now) {
+                Ok(cert) => return Some((cert, uri)),
+                Err(err) => warn!("Trust anchor {uri}: {err}."),
+            }
+        }
+        None
+    }
+
+    /// Checks a trust anchor certificate taken from the store.
+    ///
+    /// Returns the certificate if it is a valid trust anchor certificate
+    /// for the TAL at `now`. Anything else is treated as if there was no
+    /// stored certificate.
+    //
+    //  This includes a certificate that isn’t valid yet, which can happen
+    //  if the clock was set back. It will be replaced by whatever is
+    //  retrieved.
+    fn check_cached_ta(
+        &self, bytes: Bytes, tal: &Tal, now: Time,
+    ) -> Option<ResourceCert> {
+        match check_ta_cert(bytes, tal, self.validation.strict, now) {
+            Ok(cert) => Some(cert),
+            Err(err) => {
+                info!(
+                    "Cached trust anchor certificate for TAL {}: {err}. \
+                     Ignoring.",
+                    tal.info().name()
+                );
+                None
+            }
+        }
+    }
+
+    /// Returns the most preferred stored trust anchor certificate for a TAL.
+    ///
+    /// This is the certificate stored for the key of the TAL unless an
+    /// earlier version of Routinator has left behind a more preferred
+    /// certificate for one of the TAL’s URIs.
+    fn cached_ta(
+        &self, tal: &Tal, now: Time,
+    ) -> Result<Option<ResourceCert>, Failed> {
+        let mut res = self.store.load_ta(
+            tal.key_info().key_identifier()
+        )?.and_then(|bytes| {
+            self.check_cached_ta(bytes, tal, now)
+        });
+        for uri in tal.uris() {
+            let Some(bytes) = self.store.load_legacy_ta(uri)? else {
+                continue
+            };
+            let Some(cert) = self.check_cached_ta(bytes, tal, now) else {
+                continue
+            };
+
+            // A legacy certificate has to be strictly preferred. Legacy
+            // files aren’t removed if cleanup is disabled and must not
+            // undo an earlier choice between equally preferred
+            // certificates.
+            let preferred = match res.as_ref() {
+                Some(res) => {
+                    ta_order(cert.validity(), res.validity())
+                        == cmp::Ordering::Greater
+                }
+                None => true,
+            };
+            if preferred {
+                res = Some(cert)
+            }
+        }
+        Ok(res)
+    }
+
+    /// Selects the trust anchor certificate to use for a TAL.
+    ///
+    /// The certificate retrieved during this run and the URI it was
+    /// retrieved from are given in `fetched`, if there is one. It must have
+    /// been checked already. It is selected unless the stored certificate
+    /// is preferred over it. The selected certificate is stored for use in
+    /// later runs.
+    ///
+    /// Returns the selected certificate and a URI for it. For the stored
+    /// certificate this is the first URI of the TAL. Returns `Ok(None)` if
+    /// there is neither a retrieved nor a valid stored certificate.
+    fn select_ta<'t>(
+        &self,
+        tal: &'t Tal,
+        fetched: Option<(ResourceCert, &'t TalUri)>,
+        now: Time,
+    ) -> Result<Option<(ResourceCert, &'t TalUri)>, Failed> {
+        // No URIs, no trust anchor.
+        let Some(first_uri) = tal.uris().next() else {
+            return Ok(None)
+        };
+
+        // There can be more than one TAL with the same key. Only one of
+        // them at a time gets to look at and update the stored certificate.
+        let _lock = self.ta_lock.lock().unwrap();
+
+        let (cert, uri) = match (fetched, self.cached_ta(tal, now)?) {
+            (Some((fetched, uri)), Some(cached)) => {
+                match ta_order(fetched.validity(), cached.validity()) {
+                    cmp::Ordering::Less => {
+                        if fetched.validity().not_before()
+                            < cached.validity().not_before()
+                        {
+                            warn!(
+                                "Trust anchor {uri}: retrieved certificate \
+                                 is older than the cached certificate. \
+                                 Using the cached certificate."
+                            );
+                        }
+                        else {
+                            warn!(
+                                "Trust anchor {uri}: retrieved certificate \
+                                 has a longer validity than the cached \
+                                 certificate. Using the cached certificate."
+                            );
+                        }
+                        (cached, first_uri)
+                    }
+                    // If neither is preferred, the retrieved certificate
+                    // is used.
+                    _ => (fetched, uri)
+                }
+            }
+            (Some(fetched), None) => fetched,
+            (None, Some(cached)) => {
+                if self.collector.is_some() {
+                    info!(
+                        "No trust anchor certificate retrieved for TAL {}. \
+                         Using the cached certificate.",
+                        tal.info().name()
+                    );
+                }
+                (cached, first_uri)
+            }
+            (None, None) => return Ok(None),
+        };
+
+        self.store.update_ta(
+            tal.key_info().key_identifier(), &cert.to_captured()
+        )?;
+        Ok(Some((cert, uri)))
+    }
+}
+
+
+//------------ Trust Anchor Certificate Checks -------------------------------
+
+/// Returns which of two trust anchor certificates for a key is preferred.
+///
+/// The certificates are given through their validity. The function returns
+/// `Greater` if `left` is preferred, `Less` if `right` is preferred, and
+/// `Equal` if neither is.
+///
+/// This is the order defined by draft-ietf-sidrops-rpki-ta-tiebreaker: The
+/// certificate with the more recent notBefore is preferred. If notBefore is
+/// the same, the certificate with the shorter validity, i.e., the earlier
+/// notAfter, is preferred.
+//
+//  This means that a certificate that was re-issued with nothing but a
+//  later notAfter will not be used until the stored certificate has expired
+//  or was removed.
+fn ta_order(left: Validity, right: Validity) -> cmp::Ordering {
+    left.not_before().cmp(&right.not_before()).then_with(|| {
+        right.not_after().cmp(&left.not_after())
+    })
+}
+
+/// Checks that `bytes` contains a valid trust anchor certificate for `tal`.
+///
+/// The certificate has to decode, has to have the key given in the TAL and
+/// has to be a valid self-signed CA certificate at `now`.
+fn check_ta_cert(
+    bytes: Bytes, tal: &Tal, strict: bool, now: Time,
+) -> Result<ResourceCert, TaCertError> {
+    let cert = Cert::decode(bytes).map_err(|_| TaCertError::Decode)?;
+    if cert.subject_public_key_info() != tal.key_info() {
+        return Err(TaCertError::KeyMismatch)
+    }
+    cert.validate_ta_at(
+        tal.info().clone(), strict, now
+    ).map_err(TaCertError::Invalid)
+}
+
+/// The reason why a certificate can’t be the trust anchor for a TAL.
+#[derive(Debug)]
+enum TaCertError {
+    /// The certificate failed to decode.
+    Decode,
+
+    /// The key of the certificate is not the key given in the TAL.
+    KeyMismatch,
+
+    /// The certificate is not a valid trust anchor certificate.
+    Invalid(ValidationError),
+}
+
+impl fmt::Display for TaCertError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            TaCertError::Decode => f.write_str("failed to decode"),
+            TaCertError::KeyMismatch => {
+                f.write_str("key doesn’t match TAL")
+            }
+            TaCertError::Invalid(ref err) => err.fmt(f),
         }
     }
 }
@@ -2340,6 +2558,14 @@ pub trait ProcessPubPoint: Sized + Send + Sync {
 
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
+    use rpki::crypto::{PublicKeyFormat, Signer};
+    use rpki::crypto::softsigner::{KeyId, SoftSigner};
+    use rpki::repository::cert::{Overclaim, TbsCert};
+    use rpki::repository::resources::{Asn, Prefix};
+    use rpki::util::base64;
+    use crate::payload::ValidationReport;
+    use crate::utils::uri::UriExt;
     use super::*;
 
     #[test]
@@ -2355,6 +2581,489 @@ mod test {
         config.rsync_args = Some(vec!["some".into()]);
         let engine = Engine::new(&config, true).unwrap();
         engine.dump(&target).unwrap();
+    }
+
+
+    //--- Trust anchor certificate selection
+
+    const HTTPS_URI: &str = "https://example.com/ta/ta.cer";
+    const RSYNC_URI: &str = "rsync://example.com/ta/ta.cer";
+
+    /// Returns the start of the given year.
+    fn year(year: i32) -> Time {
+        Time::utc(year, 1, 1, 0, 0, 0)
+    }
+
+    /// Returns the time the selection tests happen at.
+    fn now() -> Time {
+        year(2030)
+    }
+
+    /// A trust anchor key with a TAL for it.
+    struct TestTa {
+        signer: SoftSigner,
+        key: KeyId,
+        tal: Tal,
+    }
+
+    impl TestTa {
+        /// Creates a new key and a TAL with the given URIs for it.
+        fn new(uris: &[&str]) -> Self {
+            let signer = SoftSigner::new();
+            let key = signer.create_key(PublicKeyFormat::Rsa).unwrap();
+            let pubkey = signer.get_key_info(&key).unwrap();
+            let mut tal = String::new();
+            for uri in uris {
+                tal.push_str(uri);
+                tal.push('\n');
+            }
+            tal.push('\n');
+            tal.push_str(&base64::Xml.encode(&pubkey.to_info_bytes()));
+            let tal = Tal::read_named(
+                "test".into(), &mut tal.as_bytes()
+            ).unwrap();
+            assert_eq!(tal.uris().len(), uris.len());
+            TestTa { signer, key, tal }
+        }
+
+        /// Creates a TA certificate valid from the start of a year to the
+        /// start of another year.
+        fn cert(
+            &self, serial: u64, not_before: i32, not_after: i32
+        ) -> Bytes {
+            let pubkey = self.signer.get_key_info(&self.key).unwrap();
+            let mut cert = TbsCert::new(
+                serial.into(), pubkey.to_subject_name(),
+                Validity::new(year(not_before), year(not_after)),
+                None, pubkey, KeyUsage::Ca, Overclaim::Trim
+            );
+            cert.set_basic_ca(Some(true));
+            cert.set_ca_repository(Some(
+                uri::Rsync::from_str("rsync://example.com/repo/").unwrap()
+            ));
+            cert.set_rpki_manifest(Some(
+                uri::Rsync::from_str(
+                    "rsync://example.com/repo/ta.mft"
+                ).unwrap()
+            ));
+            cert.build_v4_resource_blocks(|b| b.push(Prefix::new(0, 0)));
+            cert.build_v6_resource_blocks(|b| b.push(Prefix::new(0, 0)));
+            cert.build_as_resource_blocks(|b| b.push((Asn::MIN, Asn::MAX)));
+            cert.into_cert(
+                &self.signer, &self.key
+            ).unwrap().to_captured().into_bytes()
+        }
+
+        /// Returns the key identifier of the key.
+        fn key_id(&self) -> KeyIdentifier {
+            self.tal.key_info().key_identifier()
+        }
+    }
+
+    /// An engine without collector atop an empty store.
+    struct TestEngine {
+        dir: tempfile::TempDir,
+        config: Config,
+        engine: Engine,
+    }
+
+    impl TestEngine {
+        fn new() -> Self {
+            let _ = crate::process::Process::init(); // May be inited already.
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config::default_with_paths(
+                Default::default(), dir.path().into()
+            );
+            let engine = Engine::new(&config, false).unwrap();
+            TestEngine { dir, config, engine }
+        }
+
+        /// Starts a run.
+        fn run(&self) -> Run<'_, ()> {
+            Run::new(
+                &self.engine, None, self.engine.store.start(), (), false
+            )
+        }
+
+        /// Returns the path of the TA certificate stored for a key.
+        fn key_path(&self, ta: &TestTa) -> PathBuf {
+            self.dir.path().join("stored/ta/key").join(
+                format!("{}.cer", ta.key_id()).to_lowercase()
+            )
+        }
+
+        /// Returns the path earlier versions stored a TA certificate under.
+        fn legacy_path(&self, uri: &str) -> PathBuf {
+            self.dir.path().join("stored").join(
+                match TalUri::from_str(uri).unwrap() {
+                    TalUri::Rsync(uri) => uri.unique_path("ta/rsync", ".cer"),
+                    TalUri::Https(uri) => uri.unique_path("ta/https", ".cer"),
+                }
+            )
+        }
+
+        /// Stores a TA certificate the way earlier versions did.
+        fn store_legacy(&self, uri: &str, content: &[u8]) {
+            let path = self.legacy_path(uri);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    /// Stores a TA certificate for the key of the TAL.
+    fn store(run: &Run<()>, ta: &TestTa, content: &[u8]) {
+        run.store.update_ta(ta.key_id(), content).unwrap()
+    }
+
+    /// Returns the TA certificate stored for the key of the TAL.
+    fn stored(run: &Run<()>, ta: &TestTa) -> Option<Bytes> {
+        run.store.load_ta(ta.key_id()).unwrap()
+    }
+
+    /// Selects the TA certificate for the TAL.
+    ///
+    /// The fetched certificate, if given, needs to be valid. It will have
+    /// the last URI of the TAL, so it can be told apart from the stored
+    /// certificate which has the first.
+    ///
+    /// Returns the selected certificate and its URI.
+    fn select(
+        run: &Run<()>, ta: &TestTa, fetched: Option<&Bytes>
+    ) -> Option<(Bytes, String)> {
+        let fetched = fetched.map(|bytes| {
+            (
+                check_ta_cert(bytes.clone(), &ta.tal, true, now()).unwrap(),
+                ta.tal.uris().last().unwrap()
+            )
+        });
+        run.select_ta(&ta.tal, fetched, now()).unwrap().map(|(cert, uri)| {
+            (cert.to_captured().into_bytes(), uri.to_string())
+        })
+    }
+
+    #[test]
+    fn ta_order_preorder() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        fn order(left: (i32, i32), right: (i32, i32)) -> cmp::Ordering {
+            ta_order(
+                Validity::new(year(left.0), year(left.1)),
+                Validity::new(year(right.0), year(right.1)),
+            )
+        }
+
+        // The later notBefore is preferred, whatever notAfter is.
+        assert_eq!(order((2021, 2040), (2020, 2040)), Greater);
+        assert_eq!(order((2020, 2040), (2021, 2040)), Less);
+        assert_eq!(order((2021, 2050), (2020, 2040)), Greater);
+        assert_eq!(order((2021, 2035), (2020, 2040)), Greater);
+        assert_eq!(order((2020, 2035), (2021, 2040)), Less);
+        assert_eq!(order((2020, 2050), (2021, 2040)), Less);
+
+        // With the same notBefore, the earlier notAfter is preferred.
+        assert_eq!(order((2020, 2035), (2020, 2040)), Greater);
+        assert_eq!(order((2020, 2040), (2020, 2035)), Less);
+
+        // With the same validity, there is no preference.
+        assert_eq!(order((2020, 2040), (2020, 2040)), Equal);
+    }
+
+    #[test]
+    fn check_ta_cert_rejects() {
+        let ta = TestTa::new(&[HTTPS_URI]);
+        let other = TestTa::new(&[HTTPS_URI]);
+        let check = |bytes| check_ta_cert(bytes, &ta.tal, true, now());
+
+        let cert = ta.cert(1, 2020, 2040);
+        assert!(check(cert.clone()).is_ok());
+
+        // Garbage and a partial certificate.
+        assert!(matches!(
+            check(Bytes::from_static(b"garbage")),
+            Err(TaCertError::Decode)
+        ));
+        assert!(matches!(
+            check(cert.slice(..cert.len() - 10)),
+            Err(TaCertError::Decode)
+        ));
+
+        // A valid TA certificate for some other key.
+        assert!(matches!(
+            check(other.cert(1, 2020, 2040)),
+            Err(TaCertError::KeyMismatch)
+        ));
+
+        // Expired and not yet valid.
+        assert!(matches!(
+            check(ta.cert(1, 2020, 2029)),
+            Err(TaCertError::Invalid(_))
+        ));
+        assert!(matches!(
+            check(ta.cert(1, 2031, 2040)),
+            Err(TaCertError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn ta_fetched_without_cache() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cert = ta.cert(1, 2020, 2040);
+
+        assert_eq!(stored(&run, &ta), None);
+        assert_eq!(
+            select(&run, &ta, Some(&cert)),
+            Some((cert.clone(), RSYNC_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+        assert!(env.key_path(&ta).is_file());
+    }
+
+    #[test]
+    fn ta_cached_without_fetch() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cert = ta.cert(1, 2020, 2040);
+        store(&run, &ta, &cert);
+
+        assert_eq!(
+            select(&run, &ta, None),
+            Some((cert.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+    }
+
+    #[test]
+    fn ta_without_fetch_and_cache() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+
+        assert_eq!(select(&run, &ta, None), None);
+        assert_eq!(stored(&run, &ta), None);
+    }
+
+    #[test]
+    fn ta_newer_fetched_replaces_cache() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        store(&run, &ta, &ta.cert(1, 2020, 2040));
+
+        // A later notBefore wins …
+        let cert = ta.cert(2, 2021, 2040);
+        assert_eq!(
+            select(&run, &ta, Some(&cert)),
+            Some((cert.clone(), RSYNC_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+
+        // … even if the certificate has a longer validity.
+        let cert = ta.cert(3, 2022, 2050);
+        assert_eq!(
+            select(&run, &ta, Some(&cert)),
+            Some((cert.clone(), RSYNC_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+    }
+
+    #[test]
+    fn ta_older_fetched_ignored() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cached = ta.cert(2, 2021, 2040);
+        store(&run, &ta, &cached);
+
+        // An earlier notBefore loses …
+        assert_eq!(
+            select(&run, &ta, Some(&ta.cert(1, 2020, 2040))),
+            Some((cached.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cached.clone()));
+
+        // … even if the certificate has a shorter validity.
+        assert_eq!(
+            select(&run, &ta, Some(&ta.cert(3, 2020, 2035))),
+            Some((cached.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cached));
+    }
+
+    #[test]
+    fn ta_shorter_validity_preferred() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cached = ta.cert(1, 2020, 2040);
+        store(&run, &ta, &cached);
+
+        // Same notBefore, later notAfter: the cached certificate stays.
+        assert_eq!(
+            select(&run, &ta, Some(&ta.cert(2, 2020, 2045))),
+            Some((cached.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cached));
+
+        // Same notBefore, earlier notAfter: the fetched certificate wins.
+        let cert = ta.cert(3, 2020, 2035);
+        assert_eq!(
+            select(&run, &ta, Some(&cert)),
+            Some((cert.clone(), RSYNC_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+    }
+
+    #[test]
+    fn ta_equal_validity_prefers_fetched() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cached = ta.cert(1, 2020, 2040);
+        store(&run, &ta, &cached);
+
+        let cert = ta.cert(2, 2020, 2040);
+        assert_ne!(cert, cached);
+        assert_eq!(
+            select(&run, &ta, Some(&cert)),
+            Some((cert.clone(), RSYNC_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cert));
+    }
+
+    #[test]
+    fn ta_invalid_cache_ignored() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let other = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let fetched = ta.cert(1, 2020, 2040);
+
+        // All of the certificates would be preferred over the fetched one
+        // if only they were valid.
+        for cached in [
+            // Expired.
+            ta.cert(2, 2025, 2029),
+            // Not yet valid.
+            ta.cert(2, 2031, 2040),
+            // Wrong key.
+            other.cert(2, 2025, 2040),
+            // Not a certificate.
+            Bytes::from_static(b"garbage"),
+        ] {
+            store(&run, &ta, &cached);
+            assert_eq!(select(&run, &ta, None), None);
+            assert_eq!(stored(&run, &ta), Some(cached));
+            assert_eq!(
+                select(&run, &ta, Some(&fetched)),
+                Some((fetched.clone(), RSYNC_URI.into()))
+            );
+            assert_eq!(stored(&run, &ta), Some(fetched.clone()));
+        }
+    }
+
+    #[test]
+    fn ta_legacy_seed_and_cleanup() {
+        let env = TestEngine::new();
+        let mut run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+
+        // Cleanup uses the real time, so the certificates need to be valid
+        // both then and at the time of the tests.
+        let https = ta.cert(1, 2020, 2090);
+        let rsync = ta.cert(2, 2021, 2090);
+        env.store_legacy(HTTPS_URI, &https);
+        env.store_legacy(RSYNC_URI, &rsync);
+
+        // An expired certificate stored by key.
+        let expired = TestTa::new(&[HTTPS_URI]);
+        store(&run, &expired, &expired.cert(1, 2020, 2021));
+
+        // The preferred legacy certificate is selected and stored by key.
+        assert_eq!(
+            select(&run, &ta, None),
+            Some((rsync.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(rsync.clone()));
+
+        // Cleanup only keeps the valid certificate stored by key.
+        assert!(env.legacy_path(HTTPS_URI).is_file());
+        assert!(env.legacy_path(RSYNC_URI).is_file());
+        assert!(env.key_path(&expired).is_file());
+        run.cleanup().unwrap();
+        assert!(!env.dir.path().join("stored/ta/https").exists());
+        assert!(!env.dir.path().join("stored/ta/rsync").exists());
+        assert!(!env.key_path(&expired).exists());
+        assert!(env.key_path(&ta).is_file());
+        assert_eq!(
+            select(&run, &ta, None),
+            Some((rsync, HTTPS_URI.into()))
+        );
+    }
+
+    #[test]
+    fn ta_legacy_competes_with_fetched() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let legacy = ta.cert(2, 2021, 2040);
+        env.store_legacy(HTTPS_URI, &legacy);
+
+        assert_eq!(
+            select(&run, &ta, Some(&ta.cert(1, 2020, 2040))),
+            Some((legacy.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(legacy));
+    }
+
+    #[test]
+    fn ta_legacy_does_not_override_equal() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[HTTPS_URI, RSYNC_URI]);
+        let cached = ta.cert(2, 2020, 2040);
+        store(&run, &ta, &cached);
+        env.store_legacy(HTTPS_URI, &ta.cert(1, 2020, 2040));
+
+        assert_eq!(
+            select(&run, &ta, None),
+            Some((cached.clone(), HTTPS_URI.into()))
+        );
+        assert_eq!(stored(&run, &ta), Some(cached));
+    }
+
+    #[test]
+    fn ta_no_uris() {
+        let env = TestEngine::new();
+        let run = env.run();
+        let ta = TestTa::new(&[]);
+        store(&run, &ta, &ta.cert(1, 2020, 2040));
+
+        assert!(run.select_ta(&ta.tal, None, now()).unwrap().is_none());
+    }
+
+    #[test]
+    fn ta_store_failure_fails_run() {
+        let env = TestEngine::new();
+        let ta = TestTa::new(&[HTTPS_URI]);
+        let report = ValidationReport::new(&env.config);
+        let run = Run::new(
+            &env.engine, None, env.engine.store.start(), &report, false
+        );
+
+        // A directory in place of the stored certificate can’t be read.
+        fs::create_dir_all(env.key_path(&ta)).unwrap();
+
+        assert!(
+            run.process_tal_task(
+                TalTask { tal: &ta.tal, index: 0 },
+                &SegQueue::new(), &mut RunMetrics::default(),
+            ).is_err()
+        );
+        assert!(run.had_err.load(Ordering::Relaxed));
+        assert!(run.is_fatal.load(Ordering::Relaxed));
     }
 }
 
