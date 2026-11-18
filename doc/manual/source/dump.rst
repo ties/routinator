@@ -36,8 +36,9 @@ ta
     extension ``.cer`` appended.
 
     Certificates stored by earlier versions of Routinator are kept in the
-    directories :file:`https` and :file:`rsync` until they are removed
-    after the next successful validation run.
+    directories :file:`https` and :file:`rsync`. Such a certificate is
+    removed once a certificate has been stored for its key or once it has
+    expired.
 
 .. versionadded:: 0.9.0
 .. versionchanged:: 0.11.1

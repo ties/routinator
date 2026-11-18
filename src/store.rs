@@ -63,8 +63,9 @@
 //! directory structure derived from the URI the certificate was retrieved
 //! from: `ta`, followed by the scheme, `https` or `rsync`, then the
 //! authority (i.e., hostname), and finally the SHA-256 hash of the full URI
-//! with an extension of `.cer` added. These files are still read but are
-//! removed during cleanup.
+//! with an extension of `.cer` added. These files are only used while there
+//! is no file for their key under `ta/key`. Cleanup removes them once there
+//! is one or once their certificate has expired.
 //!
 //! Finally, the `tmp` directory is used to build the publication point files
 //! in so they can be constructed without yet knowing whether the update is
@@ -77,7 +78,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use bytes::Bytes;
-use log::error;
+use log::{error, warn};
 use rpki::uri;
 use rpki::crypto::{DigestAlgorithm, KeyIdentifier};
 use rpki::repository::cert::{Cert, ResourceCert};
@@ -261,12 +262,59 @@ impl Store {
     /// The file is created in the store’s temporary path. If this succeeds,
     /// the path and file object are returned.
     fn tmp_file(&self) -> Result<NamedTempFile, Failed> {
+        self.tmp_file_with(None)
+    }
+
+    /// Creates and returns a temporary file for a trust anchor certificate.
+    ///
+    /// Temporary files can normally only be accessed by their owner. The
+    /// files for trust anchor certificates have always had the permissions
+    /// of a regular new file, so this file gets those instead.
+    fn ta_tmp_file(&self) -> Result<NamedTempFile, Failed> {
+        #[cfg(unix)]
+        let permissions = {
+            use std::os::unix::fs::PermissionsExt;
+
+            // The umask is applied when the file is created.
+            Some(fs::Permissions::from_mode(0o666))
+        };
+        #[cfg(not(unix))]
+        let permissions = None;
+
+        self.tmp_file_with(permissions)
+    }
+
+    /// Creates a temporary file, optionally with the given permissions.
+    fn tmp_file_with(
+        &self, permissions: Option<fs::Permissions>,
+    ) -> Result<NamedTempFile, Failed> {
         let tmp_dir = self.path.join(Self::TMP_BASE);
         fatal::create_dir_all(&tmp_dir)?;
-        NamedTempFile::new_in(&tmp_dir).map_err(|err| {
+        let mut builder = tempfile::Builder::new();
+        if let Some(permissions) = permissions {
+            builder.permissions(permissions);
+        }
+        builder.tempfile_in(&tmp_dir).map_err(|err| {
             error!(
                 "Fatal: failed to create temporary file in {}: {}",
                 tmp_dir.display(), err
+            );
+            Failed
+        })
+    }
+
+    /// Moves a temporary file to its final path.
+    ///
+    /// Whatever is at the path is replaced atomically. Returns the file,
+    /// still open for reading and writing.
+    fn persist_tmp_file(
+        tmp_file: NamedTempFile, path: &Path,
+    ) -> Result<File, Failed> {
+        tmp_file.persist(path).map_err(|err| {
+            error!(
+                "Failed to persist temporary file {} to {}: {}",
+                err.file.path().display(), path.display(),
+                err.error,
             );
             Failed
         })
@@ -520,15 +568,29 @@ impl<'a> Run<'a> {
     /// Loads a trust anchor certificate stored by an earlier version.
     ///
     /// Earlier versions stored trust anchor certificates by the URI they
-    /// were retrieved from.
-    pub fn load_legacy_ta(
-        &self, uri: &TalUri
-    ) -> Result<Option<Bytes>, Failed> {
-        fatal::read_existing_file(
-            &self.store.legacy_ta_path(uri)
-        ).map(|maybe| {
-            maybe.map(Into::into)
-        })
+    /// were retrieved from. These certificates are only a starting point
+    /// until there is a certificate stored for the key, see
+    /// [`load_ta`][Self::load_ta]. The store works fine without them, so a
+    /// file that can’t be read is logged and otherwise treated as if it
+    /// wasn’t there.
+    pub fn load_legacy_ta(&self, uri: &TalUri) -> Option<Bytes> {
+        Self::read_legacy_ta(&self.store.legacy_ta_path(uri))
+    }
+
+    /// Reads the file of a trust anchor certificate of an earlier version.
+    fn read_legacy_ta(path: &Path) -> Option<Bytes> {
+        match fs::read(path) {
+            Ok(content) => Some(content.into()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                warn!(
+                    "Failed to read legacy trust anchor certificate {}: {}. \
+                     Ignoring.",
+                    path.display(), err
+                );
+                None
+            }
+        }
     }
 
     /// Updates or inserts the stored trust anchor certificate for a key.
@@ -543,7 +605,7 @@ impl<'a> Run<'a> {
             return Ok(())
         }
         fatal::create_parent_all(&path)?;
-        let mut tmp_file = self.store.tmp_file()?;
+        let mut tmp_file = self.store.ta_tmp_file()?;
         if let Err(err) = tmp_file.write_all(content) {
             error!(
                 "Fatal: failed to write to file {}: {}",
@@ -551,14 +613,7 @@ impl<'a> Run<'a> {
             );
             return Err(Failed)
         }
-        if let Err(err) = tmp_file.persist(&path) {
-            error!(
-                "Failed to persist temporary file {} to {}: {}",
-                err.file.path().display(), path.display(),
-                err.error,
-            );
-            return Err(Failed)
-        }
+        Store::persist_tmp_file(tmp_file, &path)?;
         Ok(())
     }
 
@@ -642,25 +697,44 @@ impl Run<'_> {
     /// Cleans up the trust anchors.
     ///
     /// Deletes all files that either don’t successfully parse as certificates
-    /// or that are expired certificates. Also deletes everything outside of
-    /// the directory for the certificates stored by key, i.e., whatever
-    /// earlier versions have left behind. These certificates have been
-    /// considered when the run selected its trust anchor certificates, so
-    /// they aren’t needed any more.
+    /// or that are expired certificates.
+    ///
+    /// Everything outside of the directory for the certificates stored by
+    /// key was left behind by an earlier version. Such a file is also
+    /// deleted if there is a file for the key of its certificate, since it
+    /// won’t be used any more, or if it can’t be read.
     fn cleanup_ta(&self) -> Result<(), Failed> {
+        /// Returns the certificate in `content` unless it has expired.
+        fn unexpired(content: Bytes) -> Option<Cert> {
+            Cert::decode(content).ok().filter(|cert| {
+                cert.validity().not_after() > Time::now()
+            })
+        }
+
         let base = self.store.path.join(Store::TA_BASE);
         let key_path = self.store.path.join(Store::KEY_TA_PATH);
+
+        // The files of earlier versions have to go first. They are only
+        // left alone while there is no file for their key. If the file for
+        // a key was deleted before them, they would be used again.
+        Self::cleanup_dir_tree(&base, |path| {
+            if path.starts_with(&key_path) {
+                return Ok(true)
+            }
+            let Some(cert) = Self::read_legacy_ta(path).and_then(
+                unexpired
+            ) else {
+                return Ok(false)
+            };
+            let key = cert.subject_public_key_info().key_identifier();
+            Ok(self.load_ta(key)?.is_none())
+        })?;
+
         Self::cleanup_dir_tree(&base, |path| {
             if !path.starts_with(&key_path) {
-                return Ok(false)
+                return Ok(true)
             }
-            let content = fatal::read_file(path)?;
-            if let Ok(cert) = Cert::decode(Bytes::from(content)) {
-                if cert.validity().not_after() > Time::now() {
-                    return Ok(true)
-                }
-            }
-            Ok(false)
+            Ok(unexpired(fatal::read_file(path)?.into()).is_some())
         })
     }
 
@@ -1108,17 +1182,9 @@ impl StoredPoint {
         // I think we need to drop `self.file` first so it gets closed and the
         // path unlocked on Windows?
         drop(self.file.take());
-        match tmp_file.persist(&self.path) {
-            Ok(file) => self.file = Some(BufReader::new(file)),
-            Err(err) => {
-                error!(
-                    "Failed to persist temporary file {} to {}: {}",
-                    err.file.path().display(), self.path.display(),
-                    err.error,
-                );
-                return Err(UpdateError::fatal())
-            }
-        }
+        self.file = Some(BufReader::new(
+            Store::persist_tmp_file(tmp_file, &self.path)?
+        ));
         self.manifest = Some(manifest);
 
         // Position the file at the first object. (The if will always be
@@ -1701,6 +1767,20 @@ mod test {
         assert_eq!(
             run.load_ta(key).unwrap(), Some(Bytes::from_static(b"foo"))
         );
+
+        // The file has the permissions of a regular new file rather than
+        // those of a temporary file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let regular = dir.path().join("regular");
+            fs::write(&regular, b"foo").unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode(),
+                fs::metadata(&regular).unwrap().permissions().mode(),
+            );
+        }
 
         // Updating with the same content doesn’t write anything.
         fs::remove_dir(&tmp).unwrap();

@@ -4,21 +4,29 @@
 
 Breaking changes
 
+* If there is more than one TAL for the same key, only the first of them
+  by name is used and a warning is logged for each of the others.
+  Previously, each of them was processed on its own.
+* The methods `load_ta` and `update_ta` of `store::Run` in the library
+  crate now take the key identifier of the trust anchor key instead of the
+  URI of the certificate.
+
 New
 
 Improvements
 
-* Trust anchor certificates are now selected as described in
-  [draft-ietf-sidrops-rpki-ta-tiebreaker]: A retrieved certificate only
-  replaces the stored certificate if it was issued later or, if both were
-  issued at the same time, if it doesn’t expire later. This means that a
-  certificate re-issued with nothing but a later expiry time is not used
-  until the stored certificate has expired or was removed. The stored
-  certificate is now used whenever none of the URIs of the TAL provides a
-  valid certificate.
+* Trust anchor certificates are now selected as described in [RFC 10097]:
+  A retrieved certificate only replaces the stored certificate if it was
+  issued later or, if both were issued at the same time, if it doesn’t
+  expire later. This means that a certificate re-issued with nothing but a
+  later expiry time is not used until the stored certificate has expired
+  or was removed. The stored certificate is now used whenever none of the
+  URIs of the TAL provides a valid certificate.
 * The trust anchor certificate is now stored once per TAL key under
   `stored/ta/key` in the repository directory and is written atomically.
-  Certificates stored by earlier versions are picked up and moved over.
+  A certificate stored by an earlier version is used until there is a
+  certificate stored for its key. It is removed after that or once it has
+  expired.
 
 Bug fixes
 
@@ -28,7 +36,7 @@ Bug fixes
 
 Other changes
 
-[draft-ietf-sidrops-rpki-ta-tiebreaker]: https://datatracker.ietf.org/doc/draft-ietf-sidrops-rpki-ta-tiebreaker/
+[RFC 10097]: https://www.rfc-editor.org/rfc/rfc10097.html
 
 
 ## 0.16.1 ‘You Cry, You Learn’
